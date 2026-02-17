@@ -237,6 +237,26 @@ final class StatusBarController: NSObject {
         }
     }
 
+    private func menuBarDisplayAccount(for provider: ProviderIdentifier) -> String? {
+        guard let dict = UserDefaults.standard.dictionary(forKey: StatusBarDisplayPreferences.providerAccountKey),
+              let account = dict[provider.rawValue] as? String else {
+            return nil
+        }
+        return account
+    }
+
+    private func setMenuBarDisplayAccount(_ account: String?, for provider: ProviderIdentifier) {
+        var dict = UserDefaults.standard.dictionary(forKey: StatusBarDisplayPreferences.providerAccountKey) ?? [:]
+        if let account = account {
+            dict[provider.rawValue] = account
+        } else {
+            dict.removeValue(forKey: provider.rawValue)
+        }
+        UserDefaults.standard.set(dict, forKey: StatusBarDisplayPreferences.providerAccountKey)
+        updateStatusBarDisplayMenuState()
+        updateStatusBarText()
+    }
+
     private var criticalBadgeEnabled: Bool {
         get {
             boolPreference(forKey: StatusBarDisplayPreferences.criticalBadgeKey, defaultValue: true)
@@ -567,6 +587,21 @@ final class StatusBarController: NSObject {
         menuBarDisplayMode = .onlyShow
         onlyShowMode = .pinnedProvider
         menuBarDisplayProvider = identifier
+        setMenuBarDisplayAccount(nil, for: identifier)
+    }
+
+    @objc private func menuBarOnlyShowProviderAccountSelected(_ sender: NSMenuItem) {
+        guard let dict = sender.representedObject as? [String: String],
+              let providerRaw = dict["provider"],
+              let identifier = ProviderIdentifier(rawValue: providerRaw),
+              let account = dict["account"] else {
+            return
+        }
+        debugLog("menuBarOnlyShowProviderAccountSelected: provider=\(identifier.displayName), account=\(account)")
+        menuBarDisplayMode = .onlyShow
+        onlyShowMode = .pinnedProvider
+        menuBarDisplayProvider = identifier
+        setMenuBarDisplayAccount(account, for: identifier)
     }
 
     @objc private func toggleCriticalBadge(_ sender: NSMenuItem) {
@@ -619,6 +654,103 @@ final class StatusBarController: NSObject {
 
         criticalBadgeMenuItem?.state = criticalBadgeEnabled ? .on : .off
         showProviderNameMenuItem?.state = showProviderName ? .on : .off
+    }
+
+    private func updateProviderAccountMenus() {
+        guard let onlyShowProviderMenu = onlyShowProviderMenu else { return }
+        onlyShowProviderMenu.autoenablesItems = false
+        
+        let currentProvider = menuBarDisplayProvider
+        let currentAccount = currentProvider.flatMap { menuBarDisplayAccount(for: $0) }
+        let isCurrentProvider = onlyShowMode == .pinnedProvider && menuBarDisplayMode == .onlyShow
+        
+        for providerItem in onlyShowProviderMenu.items {
+            guard let providerRaw = providerItem.representedObject as? String,
+                  let identifier = ProviderIdentifier(rawValue: providerRaw) else {
+                continue
+            }
+            
+            let accounts: [ProviderAccountInfo]
+            if let result = providerResults[identifier] {
+                accounts = getAccountsForProvider(identifier, result: result)
+            } else {
+                accounts = []
+            }
+            
+            debugLog("updateProviderAccountMenus: \(identifier.displayName) has \(accounts.count) accounts")
+            
+            let isPinned = currentProvider == identifier && isCurrentProvider
+            
+            if accounts.count > 1 {
+                providerItem.action = nil
+                let submenu = NSMenu()
+                submenu.autoenablesItems = false
+                
+                for account in accounts {
+                    let accountItem = NSMenuItem(
+                        title: account.displayName,
+                        action: #selector(menuBarOnlyShowProviderAccountSelected(_:)),
+                        keyEquivalent: ""
+                    )
+                    accountItem.target = self
+                    accountItem.representedObject = ["provider": identifier.rawValue, "account": account.id]
+                    accountItem.state = (isPinned && currentAccount == account.id) ? .on : .off
+                    accountItem.isEnabled = true
+                    submenu.addItem(accountItem)
+                }
+                
+                providerItem.submenu = submenu
+                providerItem.state = .off
+                debugLog("updateProviderAccountMenus: created submenu for \(identifier.displayName) with \(submenu.items.count) items")
+            } else {
+                providerItem.submenu = nil
+                providerItem.action = #selector(menuBarOnlyShowProviderSelected(_:))
+                providerItem.state = isPinned ? .on : .off
+            }
+            
+            providerItem.isEnabled = isProviderEnabled(identifier)
+        }
+    }
+
+    private struct ProviderAccountInfo {
+        let id: String
+        let displayName: String
+    }
+
+    private func getAccountsForProvider(_ identifier: ProviderIdentifier, result: ProviderResult) -> [ProviderAccountInfo] {
+        var accounts: [ProviderAccountInfo] = []
+        
+        if let providerAccounts = result.accounts, providerAccounts.count > 1 {
+            for account in providerAccounts {
+                let id: String
+                let displayName: String
+                if let accountId = account.accountId, !accountId.isEmpty {
+                    id = accountId
+                    displayName = accountId
+                } else {
+                    id = "index_\(account.accountIndex)"
+                    displayName = "Account #\(account.accountIndex + 1)"
+                }
+                accounts.append(ProviderAccountInfo(id: id, displayName: displayName))
+            }
+        }
+        
+        if identifier == .geminiCLI, let geminiAccounts = result.details?.geminiAccounts, geminiAccounts.count > 1 {
+            for account in geminiAccounts {
+                let id: String
+                let displayName: String
+                if let accountId = account.accountId, !accountId.isEmpty {
+                    id = accountId
+                    displayName = "\(account.email) (\(accountId))"
+                } else {
+                    id = "index_\(account.accountIndex)"
+                    displayName = account.email.isEmpty ? "Account #\(account.accountIndex + 1)" : account.email
+                }
+                accounts.append(ProviderAccountInfo(id: id, displayName: displayName))
+            }
+        }
+        
+        return accounts
     }
 
     private func updatePredictionPeriodMenu() {
@@ -946,42 +1078,67 @@ final class StatusBarController: NSObject {
             .max()
     }
 
-    /// Collects all UsagePercentCandidates from all accounts for a provider,
-    /// then applies the global priority rule: pick the highest-priority window
-    /// across ALL accounts, then return the max percent within that window.
-    /// This prevents a high hourly value from one account beating a lower weekly
-    /// value from another account.
-    private func preferredUsedPercentForStatusBar(identifier: ProviderIdentifier, result: ProviderResult) -> Double? {
+    private func preferredUsedPercentForStatusBar(identifier: ProviderIdentifier, result: ProviderResult, selectedAccountId: String? = nil) -> Double? {
         var allCandidates: [UsagePercentCandidate] = []
 
-        // Main result candidates
-        if case .quotaBased = result.usage {
-            allCandidates.append(contentsOf:
-                usagePercentCandidates(identifier: identifier, usage: result.usage, details: result.details)
-            )
-        }
-
-        // Sub-account candidates
-        if let accounts = result.accounts {
-            for account in accounts {
-                guard case .quotaBased = account.usage else { continue }
+        if let accountId = selectedAccountId {
+            if let accounts = result.accounts {
+                for account in accounts {
+                    let matchesSelection: Bool
+                    if accountId.hasPrefix("index_"), let index = Int(accountId.replacingOccurrences(of: "index_", with: "")) {
+                        matchesSelection = account.accountIndex == index
+                    } else {
+                        matchesSelection = account.accountId == accountId
+                    }
+                    
+                    guard matchesSelection else { continue }
+                    guard case .quotaBased = account.usage else { continue }
+                    allCandidates.append(contentsOf:
+                        usagePercentCandidates(identifier: identifier, usage: account.usage, details: account.details)
+                    )
+                }
+            }
+            
+            if identifier == .geminiCLI, let geminiAccounts = result.details?.geminiAccounts {
+                for account in geminiAccounts {
+                    let matchesSelection: Bool
+                    if accountId.hasPrefix("index_"), let index = Int(accountId.replacingOccurrences(of: "index_", with: "")) {
+                        matchesSelection = account.accountIndex == index
+                    } else {
+                        matchesSelection = account.accountId == accountId
+                    }
+                    
+                    guard matchesSelection else { continue }
+                    if let normalized = normalizedUsagePercent(100.0 - account.remainingPercentage) {
+                        allCandidates.append(UsagePercentCandidate(percent: normalized, priority: .fallback))
+                    }
+                }
+            }
+        } else {
+            if case .quotaBased = result.usage {
                 allCandidates.append(contentsOf:
-                    usagePercentCandidates(identifier: identifier, usage: account.usage, details: account.details)
+                    usagePercentCandidates(identifier: identifier, usage: result.usage, details: result.details)
                 )
             }
-        }
 
-        // Gemini CLI special case: add as fallback priority since these don't have window metadata
-        if identifier == .geminiCLI, let geminiAccounts = result.details?.geminiAccounts {
-            for account in geminiAccounts {
-                if let normalized = normalizedUsagePercent(100.0 - account.remainingPercentage) {
-                    allCandidates.append(UsagePercentCandidate(percent: normalized, priority: .fallback))
+            if let accounts = result.accounts {
+                for account in accounts {
+                    guard case .quotaBased = account.usage else { continue }
+                    allCandidates.append(contentsOf:
+                        usagePercentCandidates(identifier: identifier, usage: account.usage, details: account.details)
+                    )
+                }
+            }
+
+            if identifier == .geminiCLI, let geminiAccounts = result.details?.geminiAccounts {
+                for account in geminiAccounts {
+                    if let normalized = normalizedUsagePercent(100.0 - account.remainingPercentage) {
+                        allCandidates.append(UsagePercentCandidate(percent: normalized, priority: .fallback))
+                    }
                 }
             }
         }
 
-        // Apply global priority rule: pick highest priority (lowest rawValue),
-        // then max percent within that priority
         guard let selectedPriority = allCandidates.map(\.priority.rawValue).min() else {
             return nil
         }
@@ -1179,12 +1336,13 @@ final class StatusBarController: NSObject {
     }
 
     private func formatProviderForStatusBar(identifier: ProviderIdentifier, result: ProviderResult) -> String {
+        let selectedAccountId = menuBarDisplayAccount(for: identifier)
         switch result.usage {
         case .payAsYouGo(_, let cost, _):
             let costText = formatCostForStatusBar(cost ?? 0)
             return showProviderName ? "\(identifier.shortDisplayName) \(costText)" : costText
         case .quotaBased:
-            let maxPercent = preferredUsedPercentForStatusBar(identifier: identifier, result: result) ?? result.usage.usagePercentage
+            let maxPercent = preferredUsedPercentForStatusBar(identifier: identifier, result: result, selectedAccountId: selectedAccountId) ?? result.usage.usagePercentage
             let usageText = String(format: "%.0f%%", maxPercent)
             return showProviderName ? "\(identifier.shortDisplayName) \(usageText)" : usageText
         }
@@ -2034,6 +2192,7 @@ final class StatusBarController: NSObject {
 
         let totalCost = calculateTotalWithSubscriptions(providerResults: providerResults, copilotUsage: currentUsage)
         refreshRecentChangeCandidate()
+        updateProviderAccountMenus()
         updateStatusBarDisplayMenuState()
         updateStatusBarText()
         debugLog("updateMultiProviderMenu: completed successfully, totalCost=$\(totalCost)")
