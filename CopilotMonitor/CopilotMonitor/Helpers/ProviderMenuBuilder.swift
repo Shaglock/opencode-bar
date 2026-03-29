@@ -107,76 +107,21 @@ extension StatusBarController {
                 }
             }
 
-            submenu.addItem(NSMenuItem.separator())
-            let historyItem = NSMenuItem(title: "Usage History", action: nil, keyEquivalent: "")
-            historyItem.image = NSImage(systemSymbolName: "chart.bar.fill", accessibilityDescription: "Usage History")
-            let historySubmenu = NSMenu()
-
-            let loadingState = OpenCodeZenProvider.loadingState
-            let dateFormatter = DateFormatter()
-            dateFormatter.dateFormat = "MMM d"
-
-            let historyToDisplay: [DailyUsage]
-            if loadingState.isLoading || !loadingState.dailyHistory.isEmpty {
-                historyToDisplay = loadingState.dailyHistory
-            } else if let history = details.dailyHistory {
-                historyToDisplay = Array(history.prefix(30))
-            } else {
-                historyToDisplay = []
-            }
-
-            if historyToDisplay.isEmpty && !loadingState.isLoading {
-                let noDataItem = NSMenuItem()
-                noDataItem.view = createDisabledLabelView(text: "No history data")
-                historySubmenu.addItem(noDataItem)
-            } else {
-                for day in historyToDisplay.prefix(30) {
-                    let cost = day.billedAmount
-                    let title = String(format: "%@: $%.2f", dateFormatter.string(from: day.date), cost)
-                    let item = NSMenuItem()
-                    item.view = createDisabledLabelView(text: title, monospaced: true)
-                    historySubmenu.addItem(item)
-                }
-
-                if loadingState.isLoading {
-                    historySubmenu.addItem(NSMenuItem.separator())
-                    let loadingText = "Loading day \(loadingState.currentDay)/\(loadingState.totalDays)..."
-                    let loadingItem = NSMenuItem()
-                    loadingItem.view = createDisabledLabelView(
-                        text: loadingText,
-                        icon: NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Loading"),
-                        font: NSFont.systemFont(ofSize: 11, weight: .medium)
-                    )
-                    historySubmenu.addItem(loadingItem)
-                }
-
-                if let error = loadingState.lastError, !loadingState.isLoading {
-                    historySubmenu.addItem(NSMenuItem.separator())
-                    let errorItem = NSMenuItem()
-                    errorItem.view = createDisabledLabelView(
-                        text: error,
-                        icon: NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: "Error")
-                    )
-                    historySubmenu.addItem(errorItem)
-                }
-            }
-
-            historyItem.submenu = historySubmenu
-            submenu.addItem(historyItem)
-
         case .copilot:
             // === Usage ===
             if let used = details.copilotUsedRequests, let limit = details.copilotLimitRequests, limit > 0 {
-                let usageRatio = Double(used) / Double(max(limit, 1))
+                let isUnlimitedPlan = limit == Int.max
+                let usageRatio = isUnlimitedPlan ? 0.0 : (Double(used) / Double(max(limit, 1)))
                 let normalizedUsageRatio = min(max(usageRatio, 0), 1)
                 let filledBlocks = Int(normalizedUsageRatio * 10)
                 let emptyBlocks = 10 - filledBlocks
                 let progressBar = String(repeating: "═", count: filledBlocks) + String(repeating: "░", count: emptyBlocks)
+                let limitText = isUnlimitedPlan ? "Unlimited" : "\(limit)"
                 let progressItem = NSMenuItem()
-                progressItem.view = createDisabledLabelView(text: "[\(progressBar)] \(used)/\(limit)")
+                progressItem.view = createDisabledLabelView(text: "[\(progressBar)] \(used)/\(limitText)")
                 submenu.addItem(progressItem)
 
-                let usagePercent = (Double(used) / Double(limit)) * 100
+                let usagePercent = isUnlimitedPlan ? 0.0 : ((Double(used) / Double(limit)) * 100)
                 let items = createUsageWindowRow(label: "Monthly", usagePercent: usagePercent, resetDate: details.copilotQuotaResetDateUTC, isMonthly: true)
                 items.forEach { submenu.addItem($0) }
             } else {
@@ -208,7 +153,8 @@ extension StatusBarController {
 
             if let limit = details.copilotLimitRequests {
                 let freeItem = NSMenuItem()
-                freeItem.view = createDisabledLabelView(text: "Quota Limit: \(limit)")
+                let limitText = (limit == Int.max) ? "Unlimited" : "\(limit)"
+                freeItem.view = createDisabledLabelView(text: "Quota Limit: \(limitText)")
                 submenu.addItem(freeItem)
             }
 
@@ -737,7 +683,8 @@ extension StatusBarController {
             submenu.addItem(item)
         }
 
-        if let authSource = details.authSource {
+        // Skip generic "Token From:" for providers that already render it in their case block above.
+        if let authSource = details.authSource, identifier != .copilot {
             submenu.addItem(NSMenuItem.separator())
             let authItem = NSMenuItem()
             authItem.view = createDisabledLabelView(

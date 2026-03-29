@@ -110,7 +110,7 @@ final class ProviderUsageTests: XCTestCase {
         XCTAssertTrue(output.contains("55%"))
     }
 
-    func testTableFormatterShowsDualPercentForAntigravityGeminiAccounts() {
+    func testTableFormatterShowsGeminiPercentOnlyForGeminiAccounts() {
         let geminiAccounts = [
             GeminiAccountQuota(
                 accountIndex: 0,
@@ -144,7 +144,108 @@ final class ProviderUsageTests: XCTestCase {
             .antigravity: antigravityResult
         ])
 
-        XCTAssertTrue(output.contains("70%,60%"))
+        XCTAssertTrue(output.contains("Gemini (#1)"))
+        XCTAssertTrue(output.contains("70%"))
+        XCTAssertFalse(output.contains("70%,60%"))
+    }
+
+    func testProviderDisplayPolicyKeepsClaudeAccountRowsVisibleDuringRateLimitCooldown() {
+        let result = ProviderResult(
+            usage: .quotaBased(remaining: 20, entitlement: 100, overagePermitted: false),
+            details: DetailedUsage(email: "primary@example.com"),
+            accounts: [
+                ProviderAccountResult(
+                    accountIndex: 0,
+                    accountId: "primary@example.com",
+                    usage: .quotaBased(remaining: 20, entitlement: 100, overagePermitted: false),
+                    details: DetailedUsage(email: "primary@example.com")
+                ),
+                ProviderAccountResult(
+                    accountIndex: 1,
+                    accountId: "secondary@example.com",
+                    usage: .quotaBased(remaining: 0, entitlement: 0, overagePermitted: false),
+                    details: DetailedUsage(email: "secondary@example.com", authErrorMessage: "Rate limited")
+                )
+            ]
+        )
+
+        XCTAssertFalse(
+            ProviderDisplayPolicy.shouldShowRateLimitedErrorRow(
+                identifier: .claude,
+                errorMessage: "Rate limited. Retrying in 8m.",
+                result: result
+            )
+        )
+    }
+
+    func testProviderDisplayPolicyShowsRateLimitErrorRowWithoutAccountRows() {
+        let result = ProviderResult(
+            usage: .quotaBased(remaining: 40, entitlement: 100, overagePermitted: false),
+            details: DetailedUsage(tokenUsagePercent: 60),
+            accounts: nil
+        )
+
+        XCTAssertTrue(
+            ProviderDisplayPolicy.shouldShowRateLimitedErrorRow(
+                identifier: .zaiCodingPlan,
+                errorMessage: "Rate limited. Retrying in 8m.",
+                result: result
+            )
+        )
+    }
+
+    func testProviderManagerUsesMinimumFetchIntervalForClaude() async {
+        let provider = CountingStubProvider(
+            identifier: .claude,
+            minimumFetchInterval: 10 * 60,
+            delayNanoseconds: 0,
+            result: makeQuotaResult(remaining: 42)
+        )
+        let manager = ProviderManager(providers: [provider])
+
+        let first = await manager.fetchAll()
+        let second = await manager.fetchAll()
+        let fetchCount = await provider.fetchCount()
+
+        XCTAssertEqual(fetchCount, 1)
+        XCTAssertEqual(first.results[.claude]?.usage.remainingQuota, 42)
+        XCTAssertEqual(second.results[.claude]?.usage.remainingQuota, 42)
+        XCTAssertTrue(second.errors.isEmpty)
+    }
+
+    func testProviderManagerDeduplicatesConcurrentFetches() async {
+        let provider = CountingStubProvider(
+            identifier: .claude,
+            minimumFetchInterval: 0,
+            delayNanoseconds: 250_000_000,
+            result: makeQuotaResult(remaining: 33)
+        )
+        let manager = ProviderManager(providers: [provider])
+
+        async let first = manager.fetchAll()
+        async let second = manager.fetchAll()
+        let (firstResult, secondResult) = await (first, second)
+        let fetchCount = await provider.fetchCount()
+
+        XCTAssertEqual(fetchCount, 1)
+        XCTAssertEqual(firstResult.results[.claude]?.usage.remainingQuota, 33)
+        XCTAssertEqual(secondResult.results[.claude]?.usage.remainingQuota, 33)
+    }
+
+    func testProviderManagerKeepsRateLimitStatusDuringCooldownWithoutCache() async {
+        let provider = RateLimitedStubProvider(identifier: .claude, minimumFetchInterval: 10 * 60)
+        let manager = ProviderManager(providers: [provider])
+
+        let first = await manager.fetchAll()
+        let second = await manager.fetchAll()
+        let fetchCount = await provider.fetchCount()
+
+        XCTAssertEqual(fetchCount, 1)
+        XCTAssertNil(first.results[.claude])
+        XCTAssertEqual(first.errors[.claude], "Network error: Rate limited. Please try again later.")
+        XCTAssertNil(second.results[.claude])
+        XCTAssertTrue(second.errors[.claude]?.contains("Rate limited") == true)
+        XCTAssertTrue(second.errors[.claude]?.contains("Retrying in") == true)
     }
     
     // MARK: - Helper Methods
@@ -169,5 +270,80 @@ final class ProviderUsageTests: XCTestCase {
         let data = try XCTUnwrap(jsonString.data(using: .utf8))
         let jsonObject = try JSONSerialization.jsonObject(with: data, options: [])
         return try XCTUnwrap(jsonObject as? [String: Any])
+    }
+
+    private func makeQuotaResult(remaining: Int) -> ProviderResult {
+        ProviderResult(
+            usage: .quotaBased(remaining: remaining, entitlement: 100, overagePermitted: false),
+            details: nil
+        )
+    }
+}
+
+private actor StubProviderState {
+    private var fetchCount = 0
+
+    func incrementFetchCount() {
+        fetchCount += 1
+    }
+
+    func currentFetchCount() -> Int {
+        fetchCount
+    }
+}
+
+private final class CountingStubProvider: ProviderProtocol {
+    let identifier: ProviderIdentifier
+    let type: ProviderType = .quotaBased
+    let minimumFetchInterval: TimeInterval
+
+    private let delayNanoseconds: UInt64
+    private let result: ProviderResult
+    private let state = StubProviderState()
+
+    init(
+        identifier: ProviderIdentifier,
+        minimumFetchInterval: TimeInterval,
+        delayNanoseconds: UInt64,
+        result: ProviderResult
+    ) {
+        self.identifier = identifier
+        self.minimumFetchInterval = minimumFetchInterval
+        self.delayNanoseconds = delayNanoseconds
+        self.result = result
+    }
+
+    func fetch() async throws -> ProviderResult {
+        await state.incrementFetchCount()
+        if delayNanoseconds > 0 {
+            try? await Task.sleep(nanoseconds: delayNanoseconds)
+        }
+        return result
+    }
+
+    func fetchCount() async -> Int {
+        await state.currentFetchCount()
+    }
+}
+
+private final class RateLimitedStubProvider: ProviderProtocol {
+    let identifier: ProviderIdentifier
+    let type: ProviderType = .quotaBased
+    let minimumFetchInterval: TimeInterval
+
+    private let state = StubProviderState()
+
+    init(identifier: ProviderIdentifier, minimumFetchInterval: TimeInterval) {
+        self.identifier = identifier
+        self.minimumFetchInterval = minimumFetchInterval
+    }
+
+    func fetch() async throws -> ProviderResult {
+        await state.incrementFetchCount()
+        throw ProviderError.networkError("Rate limited. Please try again later.")
+    }
+
+    func fetchCount() async -> Int {
+        await state.currentFetchCount()
     }
 }
