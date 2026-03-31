@@ -123,6 +123,7 @@ enum StatusBarDisplayPreferences {
     static let modeKey = "statusBarDisplay.mode"
     static let onlyShowModeKey = "statusBarDisplay.onlyShowMode"
     static let providerKey = "statusBarDisplay.provider"
+    static let providerAccountKey = "statusBarDisplay.providerAccount"
     // Legacy key kept for migration from old toggle-based UI.
     static let showAlertFirstKey = "statusBarDisplay.showAlertFirst"
     static let criticalBadgeKey = "statusBarDisplay.criticalBadge"
